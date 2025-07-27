@@ -1,0 +1,156 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+from google.colab import files
+uploaded = files.upload()
+
+import tensorflow as tf
+
+# Load the TFLite model
+tflite_model_path = '/content/drive/MyDrive/plant_disease_model_fixed.tflite'
+interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+interpreter.allocate_tensors()
+
+# Get input and output details
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+from tensorflow.keras.preprocessing import image
+import numpy as np
+
+# Replace with uploaded image name
+img_path = list(uploaded.keys())[0]
+
+# Load and preprocess
+img = image.load_img(img_path, target_size=(224, 224))
+img_array = image.img_to_array(img)
+img_array = np.expand_dims(img_array, axis=0)
+img_array = img_array / 255.0  # Normalization
+img_array = img_array.astype(np.float32)
+
+
+# Set input
+interpreter.set_tensor(input_details[0]['index'], img_array)
+
+# Invoke interpreter
+interpreter.invoke()
+
+# Get output
+output = interpreter.get_tensor(output_details[0]['index'])
+predicted_index = np.argmax(output)
+print("Predicted index:", predicted_index)
+
+# After getting prediction from TFLite model
+output = interpreter.get_tensor(output_details[0]['index'])
+
+# Get predicted index
+predicted_index = np.argmax(output)
+print("Predicted class index:", predicted_index)
+
+# Step 2: Manually define class list (in same order as during training)
+class_list = [
+    'Pepper_bell__Bacterial_spot',
+    'Pepper_bell__healthy',
+    'Potato___Early_blight',
+    'Potato___Late_blight',
+    'Potato___healthy',
+    'Tomato_Bacterial_spot',
+    'Tomato_Early_blight',
+    'Tomato_Late_blight',
+    'Tomato_Leaf_Mold',
+    'Tomato_Septoria_leaf_spot',
+    'Tomato_Spider_mites_Two_spotted_spider_mite',
+    'Tomato__Target_Spot',
+    'Tomato_Tomato_YellowLeaf_Curl_Virus',
+    'Tomato__Tomato_mosaic_virus',
+    'Tomato_healthy'
+]
+
+# Create index-to-class mapping
+index_to_class = {i: name for i, name in enumerate(class_list)}
+
+# Map prediction to class name
+predicted_class = index_to_class[predicted_index]
+print("Predicted class:", predicted_class)
+
+import matplotlib.pyplot as plt
+
+plt.imshow(img)
+plt.title(f"Predicted: {predicted_class}")
+plt.axis('off')
+plt.show()
+
+
+# Make sure `predicted_class` is already defined before this
+clean_class = predicted_class.replace("_", " ").replace("-", " ").replace("___", " ").strip()
+
+
+# Load knowledge base
+knowledge_path = "/content/drive/MyDrive/plant_data/plant_disease_knowledge.txt"
+
+with open(knowledge_path, "r") as f:
+    kb_sections = f.read().split("\n\n")  # Each disease info separated by double newlines
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Define function to retrieve relevant section
+def retrieve_info(query):
+    vectorizer = TfidfVectorizer().fit_transform(kb_sections + [query])
+    sims = cosine_similarity(vectorizer[-1], vectorizer[:-1])
+    best_match = kb_sections[sims.argmax()]
+    return best_match
+
+!pip install -q gradio transformers accelerate
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import gradio as gr
+import torch
+
+
+model_id = "mistralai/Mistral-7B-Instruct-v0.1"
+
+# Make sure to authenticate with your HF token (only once per session)
+from huggingface_hub import login
+login("HUGGING_FACE_API_TOKEN")
+
+# Load tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, device_map="auto")
+
+
+system_prompt = (
+    "You are a helpful agricultural expert. You will help users by giving specific advice "
+    "about plant diseases, their symptoms, treatments, and preventive care. Avoid vague or promotional answers."
+)
+
+chat_history = []
+
+def chat_fn(message, history):
+    global chat_history
+    chat_history.append(f"<|user|>\n{message}\n<|assistant|>")
+
+    full_prompt = f"<|system|>\n{system_prompt}\n" + "\n".join(chat_history)
+
+    inputs = tokenizer(full_prompt, return_tensors="pt", return_token_type_ids=False).to("cuda")
+    outputs = model.generate(**inputs, max_new_tokens=300, do_sample=True, temperature=0.7)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True).split("<|assistant|>")[-1].strip()
+
+    chat_history.append(response)
+    return response
+
+
+# Enhance prompt with retrieved knowledge
+retrieved_info = retrieve_info(clean_class)
+initial_prompt = f"My plant has {clean_class}. What should I do?\n\nHelpful Information:\n{retrieved_info}"
+
+initial_response = chat_fn(initial_prompt, history=[])
+
+gr.ChatInterface(
+    fn=chat_fn,
+    title="🌿 Plant Disease Advisor",
+    chatbot=gr.Chatbot(value=[
+        ("user", initial_prompt),
+        ("assistant", initial_response)
+    ])
+).launch(share=True, debug=True)
